@@ -154,6 +154,76 @@ def test_short_window_not_missed():
     assert first["peak_elevation_deg"] > peak - 0.05
 
 
+def _peak_curvature(peak, tp):
+    """Estimate d2(el)/dt2 (deg/s^2, negative) at the peak from the window
+    width 1 mdeg below it (parabolic peak model)."""
+    span = dict(start=iso(tp - timedelta(seconds=30)),
+                end=iso(tp + timedelta(seconds=30)))
+    data = client.post("/passes", json=make_body(
+        **span, min_elevation_deg=peak - 1e-3)).json()
+    d1 = data["windows"][0]["duration_s"]
+    return 2.0 * 1e-3 / (d1 / 2.0) ** 2
+
+
+def test_grazing_window_below_step_floor_is_found():
+    """Peak a hair ABOVE the threshold: the window (~8 ms) is far narrower
+    than the 20 ms dense step floor and hides between two below-threshold
+    grid samples -- the scan must subdivide and find it, not skip it."""
+    data = client.post("/passes", json=make_body()).json()
+    w0 = data["windows"][0]
+    peak = w0["peak_elevation_deg"]
+    tp = datetime.fromisoformat(w0["peak_time"].replace("Z", "+00:00"))
+    curvature = _peak_curvature(peak, tp)
+
+    eps = curvature * (8e-3 / 2.0) ** 2 / 2.0  # threshold eps below the peak
+    span = dict(start=iso(tp - timedelta(seconds=30)),
+                end=iso(tp + timedelta(seconds=30)))
+    data2 = client.post("/passes", json=make_body(
+        **span, min_elevation_deg=peak - eps)).json()
+    assert data2["status"] == "complete"
+    assert data2["uncovered_intervals"] == []
+    assert data2["count"] == 1
+    w = data2["windows"][0]
+    assert 0.0 < w["duration_s"] < 1.0
+    assert w["peak_elevation_deg"] >= peak - eps
+    # endpoints sit at the threshold (bisection accuracy)
+    epoch, pos, vel = circular_leo_state()
+    orb = TwoBodyOrbit(np.array(pos), np.array(vel))
+    sta = Station(39.9, 116.4, 0.05)
+    for key in ("start", "end"):
+        t = datetime.fromisoformat(w[key].replace("Z", "+00:00"))
+        ob = _obs(orb, (t - epoch).total_seconds(), sta, epoch)
+        assert abs(ob.elevation_deg - (peak - eps)) < 1.0e-4
+
+
+def test_unprovable_grazing_is_reported_not_complete():
+    """Peak a hair BELOW the threshold: no window exists, but the grazing
+    region cannot be proven invisible at the 1 us reporting resolution
+    either -- it must land in uncovered_intervals with an honest status,
+    never silently 'complete'."""
+    data = client.post("/passes", json=make_body()).json()
+    w0 = data["windows"][0]
+    peak = w0["peak_elevation_deg"]
+    tp = datetime.fromisoformat(w0["peak_time"].replace("Z", "+00:00"))
+    span = dict(start=iso(tp - timedelta(seconds=30)),
+                end=iso(tp + timedelta(seconds=30)))
+    data2 = client.post("/passes", json=make_body(
+        **span, min_elevation_deg=peak + 1e-7)).json()
+    assert data2["count"] == 0
+    assert data2["windows"] == []
+    assert data2["status"] == "failed"
+    assert len(data2["uncovered_intervals"]) >= 1
+    u = data2["uncovered_intervals"][0]
+    assert u["reason"]
+    u_start = datetime.fromisoformat(u["start"].replace("Z", "+00:00"))
+    u_end = datetime.fromisoformat(u["end"].replace("Z", "+00:00"))
+    assert u_start < u_end
+    assert u_start <= tp <= u_end  # brackets the unresolvable grazing peak
+    diag = data2["diagnostics"]
+    assert diag["uncovered_seconds"] > 0.0
+    assert diag["coverage_fraction"] < 1.0
+
+
 # ------------------------------------------------------------------- 422
 @pytest.mark.parametrize("field,value", [
     ("latitude_deg", 90.1),

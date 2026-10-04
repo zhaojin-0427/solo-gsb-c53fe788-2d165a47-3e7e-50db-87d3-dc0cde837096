@@ -14,10 +14,16 @@ range ``[t_start, t_end)``:
 
 2. **Dense elevation scan** inside candidate intervals. The step adapts to
    the elevation margin above/below the threshold and a global Lipschitz
-   bound ``K1`` on |d(el)/dt|. Between two *below-threshold* samples the
-   curve can then provably not cross the threshold (apart from windows
-   smaller than the 0.02 s step floor, i.e. peaks < ~0.02 deg and lasting
-   < ~0.1 s).
+   bound ``K1`` on |d(el)/dt|. A bracket whose *both* endpoints are below
+   the threshold only counts as covered when the rate bound proves the
+   curve cannot reach the threshold anywhere inside
+   (``K1 * dt <= margin/2``). Brackets too narrow for that proof are
+   bisected recursively -- which exposes any hidden crossing -- down to the
+   1 us reporting resolution of the UTC timestamps. Whatever stays
+   unproven there (a grazing contact the numbers cannot resolve) is
+   registered in ``uncovered_intervals`` instead of being silently
+   skipped, so ``status``/``coverage_fraction`` never claim a coverage
+   that was not established.
 
 Crossings are refined with bisection; the peak with golden-section search
 bracketed by the adjacent samples. Numerical failures never disappear: the
@@ -41,6 +47,21 @@ GEOMETRY_BUFFER_DEG = 8.0
 COARSE_MARGIN_DEG = 5.0
 DENSE_FLOOR_S = 0.02
 DENSE_CAP_S = 20.0
+# Hard resolution limit for the below-threshold proof search: UTC
+# timestamps are reported at microsecond precision, so a suspected
+# crossing narrower than this can neither be excluded nor represented.
+PROVE_RESOLUTION_S = 1.0e-6
+# A crossing this close to the domain start is indistinguishable from one
+# exactly on the boundary at the microsecond reporting resolution of the
+# UTC timestamps; the half-open domain then treats it as open at start.
+DOMAIN_TOL_S = 1.0e-6
+# Unresolvable sub-brackets are reported widened to this size so adjacent
+# slivers of the same grazing event merge into one uncovered interval.
+LEAF_REPORT_S = 1.0e-3
+# Global budget of extra elevation evaluations for the proof search
+# (bounds the cost of pathological near-tangent geometry; a normal 7-day
+# LEO search uses ~3e4).
+REFINE_BUDGET = 200_000
 BISECTION_ITERS = 45
 GOLDEN_ITERS = 32
 _GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0
@@ -132,6 +153,64 @@ def _elevation(orbit, t, station, epoch) -> float:
     return _obs(orbit, t, station, epoch).elevation_deg
 
 
+# ------------------------------------------------- below-threshold proof
+def _proven_below_below(el_lo: float, el_hi: float, dt: float, k1: float,
+                        threshold: float) -> bool:
+    """True when the Lipschitz rate bound proves a below-threshold bracket
+    invisible: over ``dt`` seconds the elevation can gain at most
+    ``k1 * dt`` radians, so if even half that slack exceeds neither endpoint
+    margin the curve cannot reach the threshold anywhere inside."""
+    margin = min(abs(math.radians(el_lo - threshold)),
+                 abs(math.radians(el_hi - threshold)))
+    return k1 * dt <= 0.5 * margin
+
+
+def _resolve_below_below(orbit, station, epoch, t_lo, t_hi, el_lo, el_hi,
+                         threshold, k1, t_cap, result, fail_intervals,
+                         budget):
+    """Resolve a below-threshold bracket the rate bound cannot prove.
+
+    Bisects recursively: sub-brackets satisfying the Lipschitz proof are
+    covered; an above-threshold midpoint exposes a hidden crossing and is
+    returned as ``(t, obs)`` so the caller can refine it. Sub-brackets
+    still unproven at the microsecond reporting resolution -- or left
+    pending when the refinement budget is exhausted -- are appended to
+    ``fail_intervals`` (widened to ``LEAF_REPORT_S`` so the slivers of one
+    grazing event merge). Returns None when the whole bracket was resolved
+    without finding a crossing.
+    """
+    stack = [(t_lo, t_hi, el_lo, el_hi)]
+    while stack:
+        a, c, fa, fc = stack.pop()
+        if _proven_below_below(fa, fc, c - a, k1, threshold):
+            continue
+        if c - a <= PROVE_RESOLUTION_S or budget[0] <= 0:
+            if c - a <= PROVE_RESOLUTION_S:
+                why = ("possible short grazing pass: below-threshold interval "
+                       "not provably invisible and crossing not resolvable "
+                       "at 1 us reporting resolution")
+            else:
+                why = ("below-threshold interval not proven invisible: "
+                       "elevation refinement budget exhausted")
+            fail_intervals.append(
+                (a, min(t_cap, max(c, a + LEAF_REPORT_S)), why))
+            continue
+        budget[0] -= 1
+        m = 0.5 * (a + c)
+        try:
+            om = _obs(orbit, m, station, epoch)
+        except _NUMERIC_ERRORS as exc:
+            fail_intervals.append(
+                (a, c, f"elevation evaluation failed: {exc}"))
+            continue
+        result.dense_samples += 1
+        if om.elevation_deg >= threshold:
+            return m, om
+        stack.append((m, c, om.elevation_deg, fc))
+        stack.append((a, m, fa, om.elevation_deg))
+    return None
+
+
 # --------------------------------------------------------- interval helpers
 def _merge(intervals):
     if not intervals:
@@ -144,6 +223,21 @@ def _merge(intervals):
         else:
             out.append([a, b])
     return [(a, b) for a, b in out]
+
+
+def _merge_reasons(intervals):
+    """Merge (start, end, reason) triples, keeping the reason of the first
+    contributor to each merged interval."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    out = [list(intervals[0])]
+    for a, b, why in intervals[1:]:
+        if a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b, why])
+    return [(a, b, why) for a, b, why in out]
 
 
 def _subtract(base, holes):
@@ -257,7 +351,7 @@ class _RawWindow:
 
 
 def _scan_segment(orbit, station, epoch, a, b, threshold, k1,
-                  domain_start, domain_end, result, fail_intervals):
+                  domain_start, domain_end, result, fail_intervals, budget):
     windows: list[_RawWindow] = []
     cur: Optional[_RawWindow] = None
 
@@ -325,28 +419,27 @@ def _scan_segment(orbit, station, epoch, a, b, threshold, k1,
             t_prev, o_prev = rec
             continue
 
-        # ---- refine a below-below bracket until the Lipschitz gap holds ----
-        midpoint_failed = False
-        if o_prev.elevation_deg < threshold and o_new.elevation_deg < threshold:
-            while (t_new - t_prev) > DENSE_FLOOR_S * 1.5:
-                m_lo = abs(math.radians(o_prev.elevation_deg - threshold))
-                m_hi = abs(math.radians(o_new.elevation_deg - threshold))
-                if k1 * (t_new - t_prev) <= 0.5 * min(m_lo, m_hi):
-                    break
-                t_mid = 0.5 * (t_prev + t_new)
-                o_mid = safe(t_mid)
-                result.dense_samples += 1
-                if isinstance(o_mid, tuple):
-                    rec = recover(t_prev, t_new,
-                                  f"elevation evaluation failed: {o_mid[1]}")
-                    if rec is None:
-                        return windows
-                    t_prev, o_prev = rec
-                    midpoint_failed = True
-                    break
-                t_new, o_new = t_mid, o_mid
-        if midpoint_failed:
-            continue
+        # ---- below-below bracket: prove invisible, expose a hidden ----
+        # ---- crossing, or register the bracket as uncovered. The   ----
+        # ---- step floor alone never counts as coverage.            ----
+        if (o_prev.elevation_deg < threshold
+                and o_new.elevation_deg < threshold
+                and not _proven_below_below(o_prev.elevation_deg,
+                                            o_new.elevation_deg,
+                                            t_new - t_prev, k1, threshold)):
+            found = _resolve_below_below(
+                orbit, station, epoch, t_prev, t_new,
+                o_prev.elevation_deg, o_new.elevation_deg,
+                threshold, k1, b, result, fail_intervals, budget,
+            )
+            if found is None:
+                # Bracket fully resolved without a crossing: every piece of
+                # it is either Lipschitz-proven or registered as uncovered.
+                t_prev, o_prev = t_new, o_new
+                continue
+            # Hidden crossing exposed: continue with an above-threshold
+            # right endpoint so the normal rise logic refines it.
+            t_new, o_new = found
 
         below_prev = o_prev.elevation_deg < threshold
         below_new = o_new.elevation_deg < threshold
@@ -368,7 +461,15 @@ def _scan_segment(orbit, station, epoch, a, b, threshold, k1,
                                        "bisection failed on rise crossing"))
             else:
                 tc, oc = cross
+                start_open = False
+                if (t_prev == a and abs(a - domain_start) < 1.0e-9
+                        and tc - t_prev <= DOMAIN_TOL_S):
+                    # Rise within one reporting microsecond of the domain
+                    # start: indistinguishable from a rise exactly on the
+                    # boundary, which the half-open domain includes.
+                    tc, start_open = t_prev, True
                 cur = _RawWindow(rise_t=tc, rise_az=oc.azimuth_deg,
+                                 start_open=start_open,
                                  peak_t=tc, peak_el=threshold,
                                  peak_left=tc, peak_right=t_new,
                                  max_range=oc.range_km)
@@ -443,12 +544,13 @@ def find_passes(orbit, station, epoch, t_start, t_end, min_elevation_deg):
     # ---------------- dense elevation scan ----------------
     dense_fail = []
     raw_windows = []
+    budget = [REFINE_BUDGET]
     for a, b in pieces:
         if b - a <= 1.0e-9:
             continue
         raw_windows.extend(
             _scan_segment(orbit, station, epoch, a, b, threshold, k1,
-                          s0, s1, result, dense_fail)
+                          s0, s1, result, dense_fail, budget)
         )
 
     all_fail = [(max(s0, a), min(s1, b), why) for a, b, why in coarse_fail]
@@ -488,12 +590,9 @@ def find_passes(orbit, station, epoch, t_start, t_end, min_elevation_deg):
     result.windows.sort(key=lambda x: x.start)
 
     # ---------------- uncovered intervals ----------------
-    for a, b in _merge([(x, y) for x, y, _ in all_fail]):
+    for a, b, why in _merge_reasons(all_fail):
         if b - a <= 1.0e-9:
             continue
-        why = next((reason for x, y, reason in all_fail
-                    if abs(x - a) < 1.0e-6 and abs(y - b) < 1.0e-6),
-                   "numerical failure")
         result.uncovered.append(
             UncoveredInterval(_when(epoch, a), _when(epoch, b), why)
         )

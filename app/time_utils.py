@@ -51,9 +51,16 @@ def gmst_rad(dt: datetime) -> float:
 
     where T_u is Julian centuries from J2000.0 measured at the *current*
     instant. This gives 18h41m50.543s at J2000 (2000-01-01T12:00Z).
+
+    The day count from J2000 is formed directly in seconds. Forming the
+    full Julian date first (``JD_UNIX_EPOCH + sec/86400`` ~ 2.46e6) would
+    quantize the instant to ~40 us (double precision), and the station
+    lever arm (r_station / range) amplifies each such GMST step to
+    ~1e-6 deg of elevation noise on close passes -- enough to hide or
+    invent grazing crossings.
     """
-    jd = julian_date(dt)
-    tu = (jd - JD_J2000) / DAYS_PER_JULIAN_CENTURY
+    d = (unix_seconds(dt) - UNIX_J2000) / SECONDS_PER_DAY
+    tu = d / DAYS_PER_JULIAN_CENTURY
     gmst_sec = (
         67310.54841
         + (876600.0 * 3600.0 + 8640184.812866) * tu

@@ -109,9 +109,12 @@ def passes(req: PassRequest):
         if span_s > 0 else 1.0,
         "notes": (
             "Elevation crossings refined by bisection; peaks by golden-section "
-            "search. Half-open search interval [start, end). Windows shorter "
-            "than ~0.1 s with peaks <~0.02 deg above threshold cannot be "
-            "excluded with certainty (step floor)."
+            "search. Half-open search interval [start, end). Below-threshold "
+            "intervals count as covered only when a Lipschitz rate bound "
+            "proves them invisible; unprovable brackets are bisected down to "
+            "the 1 us reporting resolution to expose hidden crossings, and "
+            "whatever stays unresolvable (grazing contacts) is reported in "
+            "uncovered_intervals instead of being silently skipped."
         ),
     }
 
