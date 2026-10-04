@@ -109,9 +109,13 @@ def passes(req: PassRequest):
         if span_s > 0 else 1.0,
         "notes": (
             "Elevation crossings refined by bisection; peaks by golden-section "
-            "search. Half-open search interval [start, end). Windows shorter "
-            "than ~0.1 s with peaks <~0.02 deg above threshold cannot be "
-            "excluded with certainty (step floor)."
+            "search. Half-open search interval [start, end). Below-threshold "
+            "brackets are certified by a first-order elevation-rate bound and "
+            "a second-order curvature bound using the analytic endpoint rates; "
+            "brackets that cannot be proven are subdivided down to the 1e-7 s "
+            "time / 1e-6 deg elevation numerical resolution, and anything "
+            "still unprovable is listed in uncovered_intervals rather than "
+            "assumed clear."
         ),
     }
 

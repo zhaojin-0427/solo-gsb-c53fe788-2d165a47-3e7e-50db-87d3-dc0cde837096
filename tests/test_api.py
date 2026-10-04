@@ -1,8 +1,7 @@
 """HTTP-level tests for POST /passes."""
 from __future__ import annotations
 
-import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
@@ -11,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.mechanics import TwoBodyOrbit
 from app.geometry import Station
-from app.passes import find_passes, _obs
+from app.passes import _obs
 from conftest import EPOCH, make_body, circular_leo_state
 
 client = TestClient(app)
@@ -148,10 +147,116 @@ def test_short_window_not_missed():
     peak = data["windows"][0]["peak_elevation_deg"]
     body = make_body(min_elevation_deg=peak - 0.05)
     data2 = client.post("/passes", json=body).json()
-    durs = [(w["end"], w["duration_s"]) for w in data2["windows"]]
     first = data2["windows"][0]
     assert first["duration_s"] < 5.0
     assert first["peak_elevation_deg"] > peak - 0.05
+
+
+def test_grazing_contact_below_step_floor_not_missed():
+    """A pass peak ~5e-6 deg above the threshold gives a contact only ~14 ms
+    wide -- narrower than the old 0.02 s dense step floor, with both
+    adjacent samples below the threshold. It must be detected, and its
+    endpoints must match an independent dense grid (regression for the bug
+    that returned empty windows + empty uncovered + complete)."""
+    from datetime import datetime, timedelta
+
+    data = client.post("/passes", json=make_body()).json()
+    w0 = data["windows"][0]
+    peak = w0["peak_elevation_deg"]
+    peak_t = datetime.fromisoformat(w0["peak_time"].replace("Z", "+00:00"))
+    epoch, pos, vel = circular_leo_state()
+    orb = TwoBodyOrbit(np.array(pos), np.array(vel))
+    sta = Station(39.9, 116.4, 0.05)
+    tp = (peak_t - epoch).total_seconds()
+
+    delta = 5.0e-6  # deg above threshold -> ~14 ms contact at this apex
+    body = make_body(
+        start=iso(epoch + timedelta(seconds=tp - 0.05)),
+        end=iso(epoch + timedelta(seconds=tp + 0.05)),
+        min_elevation_deg=peak - delta,
+    )
+    r = client.post("/passes", json=body)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["status"] == "complete"
+    assert got["count"] == 1
+    win = got["windows"][0]
+    assert 0.0 < win["duration_s"] < 0.02  # narrower than the old step floor
+    assert win["peak_elevation_deg"] >= peak - delta
+
+    # Independent 0.5 ms truth grid inside the search window.
+    t0 = tp - 0.05
+    t1 = tp + 0.05
+    thr = peak - delta
+    ts = np.arange(t0, t1, 0.0005)
+    els = np.array([_obs(orb, t, sta, epoch).elevation_deg for t in ts])
+    above = np.where(els >= thr)[0]
+    assert len(above) > 0
+    truth_rise = ts[above[0]]
+    truth_set = ts[above[-1]]
+    got_rise = (datetime.fromisoformat(
+        win["start"].replace("Z", "+00:00")) - epoch).total_seconds()
+    got_set = (datetime.fromisoformat(
+        win["end"].replace("Z", "+00:00")) - epoch).total_seconds()
+    assert abs(got_rise - truth_rise) < 0.002
+    assert abs(got_set - truth_set) < 0.002
+    assert abs(win["peak_elevation_deg"] - els.max()) < 1.0e-5
+    assert got["uncovered_intervals"] == []
+    assert got["diagnostics"]["coverage_fraction"] == 1.0
+
+
+def test_grazing_contact_at_noise_floor_is_reported_uncovered():
+    """When the threshold is so close to the peak (1e-6 deg) that whether a
+    crossing exists is below the elevation evaluation resolution, the API
+    must NOT return a noise-driven window nor claim complete: the residue
+    goes to uncovered_intervals with status failed and a reduced
+    coverage_fraction."""
+    from datetime import datetime, timedelta
+
+    data = client.post("/passes", json=make_body()).json()
+    w0 = data["windows"][0]
+    peak = w0["peak_elevation_deg"]
+    peak_t = datetime.fromisoformat(w0["peak_time"].replace("Z", "+00:00"))
+    epoch, _, _ = circular_leo_state()
+    tp = (peak_t - epoch).total_seconds()
+
+    body = make_body(
+        start=iso(epoch + timedelta(seconds=tp - 0.011)),
+        end=iso(epoch + timedelta(seconds=tp + 0.049)),
+        min_elevation_deg=peak - 1.0e-6,
+    )
+    got = client.post("/passes", json=body).json()
+    assert got["status"] == "failed"
+    assert got["count"] == 0
+    assert got["windows"] == []
+    assert len(got["uncovered_intervals"]) >= 1
+    total = sum(
+        (datetime.fromisoformat(u["end"].replace("Z", "+00:00"))
+         - datetime.fromisoformat(u["start"].replace("Z", "+00:00"))
+         ).total_seconds()
+        for u in got["uncovered_intervals"]
+    )
+    assert 0.0 < total <= 0.1
+    assert all("resolution" in u["reason"] for u in got["uncovered_intervals"])
+    assert got["diagnostics"]["uncovered_seconds"] == total
+    assert got["diagnostics"]["coverage_fraction"] < 1.0
+
+
+
+def test_empty_result_stays_complete():
+    """A search range nowhere near the station geometry reports complete
+    with zero windows and zero uncovered intervals."""
+    epoch, pos, vel = circular_leo_state()
+    body = make_body(
+        start=iso(EPOCH + timedelta(hours=2)),
+        end=iso(EPOCH + timedelta(hours=3)),
+    )
+    got = client.post("/passes", json=body).json()
+    assert got["status"] == "complete"
+    assert got["count"] == 0
+    assert got["windows"] == []
+    assert got["uncovered_intervals"] == []
+    assert got["diagnostics"]["coverage_fraction"] == 1.0
 
 
 # ------------------------------------------------------------------- 422
